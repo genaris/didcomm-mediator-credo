@@ -88,17 +88,38 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
       // Initialize Listener PUB/SUB
       await this.initializeMessageListener(agent.context, 'newMessage')
 
+      // Defensive cleanup: remove any stale live_session rows that belong to this
+      // instance identifier from previous runs. The instance name embeds a randomUUID()
+      // so this should normally be a no-op, but it costs almost nothing and protects
+      // against any future scheme that reuses instance ids.
+      try {
+        await this.messagesCollection.query('DELETE FROM live_session WHERE instance = $1', [this.instanceName])
+      } catch (cleanupError) {
+        agent.context.config.logger.warn(`[initialize] Failed startup live_session cleanup: ${cleanupError}`)
+      }
+
       // Register event handlers
       agent.events.on(
         DidCommMessagePickupEventTypes.LiveSessionRemoved,
         async (data: MessagePickupLiveSessionRemovedEvent) => {
-          const connectionId = data.payload.session.connectionId
-          agent.context.config.logger.info(`*** Session removed for connectionId: ${connectionId} ***`)
+          const { id: sessionId, connectionId } = data.payload.session
+          agent.context.config.logger.info(
+            `*** Session removed for connectionId: ${connectionId} (sessionId: ${sessionId}) ***`
+          )
 
           try {
-            // Verify message sending method and delete session record from DB
-            await this.checkQueueMessages(agent.context, connectionId)
-            await this.removeLiveSessionOnDb(agent.context, connectionId)
+            // Only revive 'sending' messages back to 'pending' if WE actually owned the
+            // live_session row that is being removed. Otherwise we would race against
+            // another instance that legitimately took ownership of this connection's
+            // pickup session and is currently delivering, causing duplicate delivery.
+            const removed = await this.removeLiveSessionOnDb(agent.context, sessionId)
+            if (removed) {
+              await this.checkQueueMessages(agent.context, connectionId)
+            } else {
+              agent.context.config.logger.debug(
+                `[LiveSessionRemoved] No live_session row owned by this instance (${this.instanceName}) for sessionId ${sessionId}; skipping checkQueueMessages to avoid racing the owning instance.`
+              )
+            }
           } catch (handlerError) {
             agent.context.config.logger.error(`Error handling LiveSessionRemoved: ${handlerError}`)
           }
@@ -543,26 +564,34 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
   }
 
   /**
-   *This method remove connectionId record to DB upon LiveSessionRemove event
-   * @param connectionId
+   * Removes the live_session row corresponding to the given pickup session id, scoped
+   * to this instance so we never delete rows owned by another mediator pod.
+   *
+   * Multiple live_session rows can legitimately coexist for the same connection_id
+   * during a session migration between pods (the new owner inserts its row before the
+   * old owner's WebSocket close fires LiveSessionRemoved). Deleting by connection_id
+   * would wipe out the still-active row on the new owner, leaving forwarded messages
+   * with `session = undefined` in addMessage — no pubsub publish, no live delivery,
+   * and (downstream) a spurious push notification.
+   *
+   * @returns true if a row was deleted (i.e. we did own a live session for this id)
    */
-  private async removeLiveSessionOnDb(agentContext: AgentContext, connectionId: string): Promise<void> {
-    agentContext.config.logger.debug(
-      `[removeLiveSessionOnDb] initializing remove LiveSession to connectionId ${connectionId}`
-    )
-    if (!connectionId) throw new Error('connectionId is not defined')
+  private async removeLiveSessionOnDb(agentContext: AgentContext, sessionId: string): Promise<boolean> {
+    agentContext.config.logger.debug(`[removeLiveSessionOnDb] initializing remove LiveSession sessionId ${sessionId}`)
+    if (!sessionId) throw new Error('sessionId is not defined')
     try {
-      // Construct the SQL query with the placeholders
-      const query = 'DELETE FROM live_session WHERE connection_id = $1'
-
-      // Add connectionId  for query parameters
-      const queryParams = [connectionId]
-
-      await this.messagesCollection?.query(query, queryParams)
-
-      agentContext.config.logger.debug(`[removeLiveSessionOnDb] removed LiveSession to connectionId ${connectionId}`)
+      const result = await this.messagesCollection?.query(
+        'DELETE FROM live_session WHERE session_id = $1 AND instance = $2 RETURNING session_id',
+        [sessionId, this.instanceName]
+      )
+      const removed = (result?.rowCount ?? 0) > 0
+      agentContext.config.logger.debug(
+        `[removeLiveSessionOnDb] removed=${removed} LiveSession sessionId ${sessionId} instance ${this.instanceName}`
+      )
+      return removed
     } catch (error) {
       agentContext.config.logger.error(`[removeLiveSessionOnDb] Error removing LiveSession: ${error}`)
+      return false
     }
   }
 
